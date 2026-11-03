@@ -12,7 +12,7 @@ collage-notes - paste images, get an auto-arranged A4 collage page.
 
 Needs: PyQt6 (or PySide6).   Run: python3 collage-notes.py [images...]
 """
-import sys, os, math, json, zipfile, hashlib
+import sys, os, math, json, zipfile, hashlib, random, time
 
 try:
     from PyQt6 import QtCore, QtGui, QtWidgets, QtPrintSupport
@@ -98,6 +98,7 @@ class Cfg:
     gap = 2.0         # mm between pictures (negative = overlap)
     margin = 8.0      # mm page margin
     autorot = False
+    smart = True      # ignore paste order, search for the best arrangement
     border = True
     guides = True
 
@@ -202,11 +203,117 @@ def layout_score(auto, npages):
     return npages * 10 + sd
 
 
+def fit_score(auto, npages, cfg):
+    """Lower = better.  Few pages, every picture close to the target row
+    height (not tiny, not huge), similar sizes, and no half-empty last page."""
+    m, g = cfg.margin, cfg.gap
+    Hp = A4_H - 2 * m
+    T = (Hp - g * (cfg.rows - 1)) / cfg.rows
+    dev = sum(math.log(max(1e-3, p.cell[3] / (T * p.weight))) ** 2 for p in auto) / len(auto)
+    areas = [math.log(max(1.0, p.cell[2] * p.cell[3])) for p in auto]
+    mean = sum(areas) / len(areas)
+    sd = math.sqrt(sum((a - mean) ** 2 for a in areas) / len(areas))
+    y0 = (npages - 1) * (A4_H + PAGE_GAP) + m
+    bottom = max(p.cell[1] + p.cell[3] for p in auto)
+    waste = max(0.0, 1.0 - (bottom - y0) / Hp)
+    return npages * 10 + 2 * dev + sd + waste
+
+
+_SMART = {"key": None, "order": []}
+
+
+def smart_order(auto, cfg, budget=0.15):
+    """Reorder the flowing pictures (paste order is ignored) to get the best
+    page fill.  Tries sensible seeds, then hill-climbs with swaps/moves."""
+    n = len(auto)
+    if n < 3:
+        return list(auto)
+    key = (tuple((id(p), round(p.aspect(), 4), p.weight) for p in auto),
+           cfg.rows, cfg.gap, cfg.margin)
+    if _SMART["key"] == key:
+        return list(_SMART["order"])
+
+    def ev(order):
+        return fit_score(order, compute_layout(order, cfg), cfg)
+
+    have = {id(p) for p in auto}
+    kept = [p for p in _SMART["order"] if id(p) in have]
+    seen = {id(p) for p in kept}
+    seeded = kept + [p for p in auto if id(p) not in seen]   # keeps old layout stable
+    by_asp = sorted(auto, key=lambda p: p.aspect())
+    inter, lo, hi = [], 0, n - 1
+    while lo <= hi:
+        inter.append(by_asp[hi])
+        hi -= 1
+        if lo <= hi:
+            inter.append(by_asp[lo])
+            lo += 1
+    best, bs = None, 1e18
+    for c in (seeded, list(auto), by_asp, by_asp[::-1], inter):
+        s = ev(c)
+        if s < bs:
+            best, bs = list(c), s
+    rnd, t0 = random.Random(7), time.perf_counter()
+    while time.perf_counter() - t0 < budget:
+        c = list(best)
+        if rnd.random() < 0.5:
+            i, j = rnd.sample(range(n), 2)
+            c[i], c[j] = c[j], c[i]
+        else:
+            c.insert(rnd.randrange(n), c.pop(rnd.randrange(n)))
+        s = ev(c)
+        if s < bs - 1e-9:
+            best, bs = c, s
+    _SMART["key"], _SMART["order"] = key, list(best)
+    return best
+
+
+def optimize_rotations(pics, cfg):
+    """One-shot: turn some images 90 degrees (aspect ratio untouched) when that
+    gives a better A4 fit.  Images the user rotated by hand are left alone.
+    The chosen turns are written into rot90.  Returns how many were turned."""
+    auto = [p for p in pics if not p.free]
+    for p in auto:                                   # bake current auto rotation
+        p.rot90 = (p.rot90 + p.auto_rot) % 4
+        p.auto_rot = 0
+    if len(auto) < 2:
+        return 0
+    if cfg.smart:
+        auto = smart_order(auto, cfg)
+
+    def ev():
+        return fit_score(auto, compute_layout(auto, cfg), cfg)
+
+    ext = lambda p: max(p.aspect(), 1 / p.aspect())
+    cands = sorted([p for p in auto if not p.lock_rot and ext(p) >= 1.3],
+                   key=lambda p: -ext(p))
+    best = ev()
+    for _ in range(3):                               # repeat until nothing improves
+        improved = False
+        for p in cands:
+            p.auto_rot ^= 1
+            s = ev()
+            if s < best - 0.03:
+                best, improved = s, True
+            else:
+                p.auto_rot ^= 1
+        if not improved:
+            break
+    n = 0
+    for p in cands:
+        if p.auto_rot:
+            p.rot90, p.auto_rot, n = (p.rot90 + 1) % 4, 0, n + 1
+    return n
+
+
 def layout_all(pics, cfg):
     auto = [p for p in pics if not p.free]
     for p in auto:
         if not p.lock_rot:
             p.auto_rot = 0
+    if cfg.smart:
+        auto = smart_order(auto, cfg)
+    cfg.order = auto                      # final on-page order (used by commit_order)
     n = compute_layout(auto, cfg)
     if cfg.autorot and len(auto) > 1:
         best = layout_score(auto, n)
@@ -766,6 +873,7 @@ class MainWindow(W_.QMainWindow):
         a_undo, a_del = A("Undo", "Ctrl+Z", self.do_undo), A("Delete", "Del", self.delete_selected)
         a_all, a_unfloat = A("Select all", "Ctrl+A", self.select_all), A("Return all floating to flow", "", self.unfloat_all)
         a_cw, a_ccw = A("Rotate right", "R", lambda: self.rotate(1)), A("Rotate left", "Shift+R", lambda: self.rotate(-1))
+        a_autorot = A("Auto-rotate images to fit (once)", "Ctrl+Shift+R", self.auto_rotate_now)
         a_crop = A("Crop...", "C", self.crop_selected)
         a_big, a_small = A("Bigger", "+|=", lambda: self.scale_sel(1.15)), A("Smaller", "-", lambda: self.scale_sel(1 / 1.15))
         a_float = A("Float / back to flow", "F", self.toggle_float)
@@ -786,7 +894,7 @@ class MainWindow(W_.QMainWindow):
         for a in (a_paste, a_undo, a_del, a_all, None, a_unfloat):
             m.addAction(a) if a else m.addSeparator()
         m = mb.addMenu("&Image")
-        for a in (a_cw, a_ccw, a_crop, None, a_big, a_small, None, a_float, a_prev, a_next, None,
+        for a in (a_cw, a_ccw, a_autorot, a_crop, None, a_big, a_small, None, a_float, a_prev, a_next, None,
                   a_front, a_back, a_tr, a_tl):
             m.addAction(a) if a else m.addSeparator()
         m = mb.addMenu("&View")
@@ -799,7 +907,7 @@ class MainWindow(W_.QMainWindow):
 
         tb = self.addToolBar("main")
         tb.setMovable(False)
-        for a in (a_paste, a_cw, a_crop, a_big, a_small, a_float, a_del, a_undo, None, a_pdf, a_copy, None, a_cap):
+        for a in (a_paste, a_cw, a_autorot, a_crop, a_big, a_small, a_float, a_del, a_undo, None, a_pdf, a_copy, None, a_cap):
             tb.addAction(a) if a else tb.addSeparator()
 
         dock = W_.QDockWidget("Layout", self)
@@ -811,10 +919,22 @@ class MainWindow(W_.QMainWindow):
         self._slider(lay, "Gap (mm)", -60, 100, int(self.cfg.gap * 10), lambda v: v / 10.0, "gap", "{:.1f}",
                      "Negative values make neighbours overlap")
         self._slider(lay, "Page margin (mm)", 30, 250, int(self.cfg.margin * 10), lambda v: v / 10.0, "margin", "{:.1f}")
+        self.cb_smart = W_.QCheckBox("Smart order (ignore paste order)")
+        self.cb_smart.setToolTip("Rearrange all images automatically for the best A4 fit:\n"
+                                 "nothing too tiny, nothing too big. Dragging an image turns this off.")
+        self.cb_smart.setChecked(self.cfg.smart)
+        self.cb_smart.toggled.connect(lambda v: self._cfg_set('smart', v))
+        lay.addWidget(self.cb_smart)
         cb = W_.QCheckBox("Auto-rotate to fit")
         cb.setToolTip("Turn awkward tall/wide images 90\u00b0 when that packs the pages better")
         cb.toggled.connect(lambda v: self._cfg_set('autorot', v))
         lay.addWidget(cb)
+        btn = W_.QPushButton("Auto-rotate images now")
+        btn.setToolTip("Click once after adding all images: turns some of them 90\u00b0 "
+                       "(aspect ratio kept) when that fits the pages better.\n"
+                       "Images you rotated yourself are left alone. Ctrl+Z undoes it.")
+        btn.clicked.connect(self.auto_rotate_now)
+        lay.addWidget(btn)
         hint = W_.QLabel("<b>Drag</b>: reorder<br><b>Shift+drag</b>: float / overlap<br>"
                          "<b>Corner drag</b>: resize<br><b>Double-click</b>: crop<br>"
                          "<b>R</b> rotate \u00b7 <b>F</b> float \u00b7 <b>+/-</b> size<br>"
@@ -925,7 +1045,34 @@ class MainWindow(W_.QMainWindow):
             p.z = (max(zs) + 1) if front else (min(zs) - 1)
         self.each_selected(f)
 
+    def auto_rotate_now(self):
+        if len([p for p in self.pics if not p.free]) < 2:
+            return
+        self.push_undo()
+        n = optimize_rotations(self.pics, self.cfg)
+        if n == 0:
+            self.undo_stack.pop()
+        self.relayout()
+        self.statusBar().showMessage(
+            "Rotated %d image%s to fit better (Ctrl+Z to undo)" % (n, "" if n == 1 else "s") if n
+            else "Layout is already a good fit - nothing rotated", 5000)
+
+    def commit_order(self):
+        """Make the current on-screen order the real order, then stop auto-ordering."""
+        if not self.cfg.smart:
+            return
+        order = getattr(self.cfg, "order", None)
+        slots = [i for i, p in enumerate(self.pics) if not p.free]
+        if order and len(order) == len(slots):
+            for i, p in zip(slots, order):
+                self.pics[i] = p
+        self.cb_smart.blockSignals(True)
+        self.cb_smart.setChecked(False)
+        self.cb_smart.blockSignals(False)
+        self.cfg.smart = False
+
     def move_order(self, d):
+        self.commit_order()
         sel = self.selected_pics()
         if len(sel) != 1:
             return
@@ -983,6 +1130,7 @@ class MainWindow(W_.QMainWindow):
         return best, before
 
     def reorder_to(self, pic, pt):
+        self.commit_order()
         t = self.drop_target(pt, pic)
         if t:
             best, before = t
