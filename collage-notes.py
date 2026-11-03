@@ -76,6 +76,41 @@ class Pic:
             return tuple(self.rect)
         return self.cell or (0, 0, 40, 40)
 
+    def text_pt(self, cfg):
+        """Printed body size (pt) of the smallest text, from its x-height as a
+        % of the picture height.  x-height ~ 0.5 of body size (sans-serif)."""
+        if cfg.text_frac <= 0:
+            return None
+        x, y, w, h = self.geom()
+        c = self.crop
+        pw = (c[2] - c[0]) * self.img.width()
+        full_h = self.img.height()
+        if self.total_rot() % 2:
+            pw, full_h = (c[3] - c[1]) * self.img.height(), self.img.width()
+        mm_per_px = w / max(1e-6, pw)
+        xh_mm = cfg.text_frac / 100.0 * full_h * mm_per_px
+        return xh_mm * 2.86 / 0.5
+
+    def flags(self, cfg):
+        """Print-size warnings: effective dpi and physical size on the A4 page."""
+        x, y, w, h = self.geom()
+        c = self.crop
+        pw = (c[2] - c[0]) * self.img.width()
+        ph = (c[3] - c[1]) * self.img.height()
+        if self.total_rot() % 2:
+            pw, ph = ph, pw
+        out = []
+        dpi = pw / max(1e-6, w / 25.4)
+        if dpi < cfg.min_dpi:
+            out.append("%d dpi" % dpi)
+        side = math.sqrt(max(0.0, w * h))
+        if side < cfg.min_side:
+            out.append("small %d mm" % side)
+        tp = self.text_pt(cfg)
+        if tp is not None and tp < cfg.min_text_pt:
+            out.append("text %.1f pt" % tp)
+        return out
+
     def refit_free(self):
         x, y, w, h = self.rect
         cx, cy, a = x + w / 2, y + h / 2, self.aspect()
@@ -99,6 +134,18 @@ class Cfg:
     margin = 8.0      # mm page margin
     autorot = False
     smart = True      # ignore paste order, search for the best arrangement
+    auto_rows = True  # pick rows-per-page (and so columns per row) automatically
+    ideal_side = 70.0 # mm: preferred picture size (sqrt of area) for auto rows
+    max_row = 6       # max pictures in one row
+    pages = 0         # 0 = any; N = try to fit everything on exactly N pages
+    guard = True      # warn about pictures that print too small / low-res
+    min_dpi = 110.0   # below this effective dpi a picture prints blurry
+    min_side = 35.0   # mm: below this a picture is too small to read
+    # Text legibility (Legge & Bigelow 2011, J. Vision 11(5):8): reading speed is
+    # maximal only above the "critical print size", x-height ~0.2 deg = 1.4 mm
+    # (= 4 pt x-height) at 40 cm, which is a body size of about 8 pt.
+    text_frac = 1.2   # % of picture height: x-height of the smallest body text in the posters
+    min_text_pt = 8.0 # body-size pt below which the text-size warning appears
     border = True
     guides = True
 
@@ -106,7 +153,7 @@ class Cfg:
 # --------------------------------------------------------------------------
 # layout engine (pure python, no Qt)
 # --------------------------------------------------------------------------
-def justify(asp, wts, W, g, T, hmax):
+def justify(asp, wts, W, g, T, hmax, maxrow=MAX_ROW):
     """Split pictures (in order) into rows whose height is close to T*weight.
     Every row is stretched to exactly fill width W.  Returns [(i, j, h)]."""
     n = len(asp)
@@ -119,7 +166,7 @@ def justify(asp, wts, W, g, T, hmax):
     best[0] = 0.0
     for j in range(1, n + 1):
         wm = 0.0
-        for i in range(j - 1, max(-1, j - MAX_ROW - 1), -1):
+        for i in range(j - 1, max(-1, j - maxrow - 1), -1):
             wm = max(wm, wts[i])
             h = (W - (j - i - 1) * g) / (S[j] - S[i])
             t = T * wm
@@ -154,7 +201,7 @@ def compute_layout(auto, cfg):
     hmax = Hp * 0.8
     T = (Hp - g * (cfg.rows - 1)) / cfg.rows
 
-    rows = justify(asp, wts, W, g, T, hmax)
+    rows = justify(asp, wts, W, g, T, hmax, cfg.max_row)
     pages, cur, used = [], [], 0.0
     for (i, j, h) in rows:                       # greedy pagination by rows
         need = h + (g if cur else 0)
@@ -170,7 +217,7 @@ def compute_layout(auto, cfg):
         sa, sw = asp[lo:hi], wts[lo:hi]
 
         def attempt(t):
-            r = justify(sa, sw, W, g, t, hmax)
+            r = justify(sa, sw, W, g, t, hmax, cfg.max_row)
             return r, rows_height(r, g)
 
         top = T * (1.35 if last else 2.2)
@@ -219,7 +266,51 @@ def fit_score(auto, npages, cfg):
     return npages * 10 + 2 * dev + sd + waste
 
 
+def auto_score(auto, npages, cfg):
+    """Score used by 'Auto rows': judged against an absolute preferred picture
+    size (mm), so different row counts can be compared fairly."""
+    n = len(auto)
+    sides = [math.sqrt(max(1.0, p.cell[2] * p.cell[3])) for p in auto]
+    dev = sum(math.log(s / cfg.ideal_side) ** 2 for s in sides) / n
+    small = sum(max(0.0, 1.0 - s / cfg.min_side) ** 2 for s in sides) / n
+    la = [2 * math.log(s) for s in sides]
+    mean = sum(la) / n
+    sd = math.sqrt(sum((a - mean) ** 2 for a in la) / n)
+    Hp = A4_H - 2 * cfg.margin
+    y0 = (npages - 1) * (A4_H + PAGE_GAP) + cfg.margin
+    bottom = max(p.cell[1] + p.cell[3] for p in auto)
+    waste = max(0.0, 1.0 - (bottom - y0) / Hp)
+    worst = max(0.0, 1.0 - min(sides) / cfg.min_side) ** 2
+    txt = 0.0
+    if cfg.guard and cfg.text_frac > 0:
+        tps = [p.text_pt(cfg) for p in auto]
+        txt = sum(max(0.0, 1.0 - t / cfg.min_text_pt) ** 2 for t in tps) / n
+    pc = 40.0 * abs(npages - cfg.pages) if cfg.pages else 4.0 * npages
+    return pc + 10 * dev + 60 * small + 25 * worst + 120 * txt + sd + 3 * waste
+
+
+def score(auto, npages, cfg):
+    return auto_score(auto, npages, cfg) if cfg.auto_rows else fit_score(auto, npages, cfg)
+
+
+def choose_rows(order, cfg):
+    """Try many rows-per-page values for this picture order, keep the best."""
+    user, step = cfg.rows, (0.25 if len(order) <= 30 else 0.5)
+    best_r, best_s, r = user, 1e18, 1.0
+    try:
+        while r <= 10.0 + 1e-9:
+            cfg.rows = r
+            s = auto_score(order, compute_layout(order, cfg), cfg)
+            if s < best_s - 1e-9:
+                best_r, best_s = r, s
+            r += step
+    finally:
+        cfg.rows = user
+    return best_r
+
+
 _SMART = {"key": None, "order": []}
+_AR = {"key": None, "rows": None, "order": []}
 
 
 def smart_order(auto, cfg, budget=0.15):
@@ -229,12 +320,13 @@ def smart_order(auto, cfg, budget=0.15):
     if n < 3:
         return list(auto)
     key = (tuple((id(p), round(p.aspect(), 4), p.weight) for p in auto),
-           cfg.rows, cfg.gap, cfg.margin)
+           cfg.rows, cfg.gap, cfg.margin, cfg.auto_rows, cfg.ideal_side, cfg.pages, cfg.max_row,
+           cfg.guard, cfg.text_frac, cfg.min_text_pt)
     if _SMART["key"] == key:
         return list(_SMART["order"])
 
     def ev(order):
-        return fit_score(order, compute_layout(order, cfg), cfg)
+        return score(order, compute_layout(order, cfg), cfg)
 
     have = {id(p) for p in auto}
     kept = [p for p in _SMART["order"] if id(p) in have]
@@ -268,6 +360,27 @@ def smart_order(auto, cfg, budget=0.15):
     return best
 
 
+def auto_fit(auto, cfg):
+    """Auto rows: choose rows-per-page and (with smart order) the picture
+    order together.  Returns (order, rows).  Columns per row follow from the
+    packer.  Result is cached until pictures or settings change."""
+    key = (tuple((id(p), round(p.aspect(), 4), p.weight) for p in auto), cfg.gap, cfg.margin,
+           cfg.ideal_side, cfg.max_row, cfg.pages, cfg.smart, cfg.guard, cfg.text_frac, cfg.min_text_pt)
+    if _AR["key"] == key and {id(p) for p in _AR["order"]} == {id(p) for p in auto}:
+        return list(_AR["order"]), _AR["rows"]
+    user, order = cfg.rows, list(auto)
+    try:
+        rows = choose_rows(order, cfg)
+        if cfg.smart:
+            cfg.rows = rows
+            order = smart_order(order, cfg)
+            rows = choose_rows(order, cfg)
+    finally:
+        cfg.rows = user
+    _AR.update(key=key, rows=rows, order=list(order))
+    return order, rows
+
+
 def optimize_rotations(pics, cfg):
     """One-shot: turn some images 90 degrees (aspect ratio untouched) when that
     gives a better A4 fit.  Images the user rotated by hand are left alone.
@@ -278,27 +391,33 @@ def optimize_rotations(pics, cfg):
         p.auto_rot = 0
     if len(auto) < 2:
         return 0
-    if cfg.smart:
-        auto = smart_order(auto, cfg)
+    user_rows = cfg.rows
+    try:
+        if cfg.auto_rows:
+            auto, cfg.rows = auto_fit(auto, cfg)
+        elif cfg.smart:
+            auto = smart_order(auto, cfg)
 
-    def ev():
-        return fit_score(auto, compute_layout(auto, cfg), cfg)
+        def ev():
+            return score(auto, compute_layout(auto, cfg), cfg)
 
-    ext = lambda p: max(p.aspect(), 1 / p.aspect())
-    cands = sorted([p for p in auto if not p.lock_rot and ext(p) >= 1.3],
-                   key=lambda p: -ext(p))
-    best = ev()
-    for _ in range(3):                               # repeat until nothing improves
-        improved = False
-        for p in cands:
-            p.auto_rot ^= 1
-            s = ev()
-            if s < best - 0.03:
-                best, improved = s, True
-            else:
+        ext = lambda p: max(p.aspect(), 1 / p.aspect())
+        cands = sorted([p for p in auto if not p.lock_rot and ext(p) >= 1.3],
+                       key=lambda p: -ext(p))
+        best = ev()
+        for _ in range(3):                           # repeat until nothing improves
+            improved = False
+            for p in cands:
                 p.auto_rot ^= 1
-        if not improved:
-            break
+                s = ev()
+                if s < best - 0.03:
+                    best, improved = s, True
+                else:
+                    p.auto_rot ^= 1
+            if not improved:
+                break
+    finally:
+        cfg.rows = user_rows
     n = 0
     for p in cands:
         if p.auto_rot:
@@ -306,13 +425,7 @@ def optimize_rotations(pics, cfg):
     return n
 
 
-def layout_all(pics, cfg):
-    auto = [p for p in pics if not p.free]
-    for p in auto:
-        if not p.lock_rot:
-            p.auto_rot = 0
-    if cfg.smart:
-        auto = smart_order(auto, cfg)
+def _layout_inner(auto, cfg):
     cfg.order = auto                      # final on-page order (used by commit_order)
     n = compute_layout(auto, cfg)
     if cfg.autorot and len(auto) > 1:
@@ -330,6 +443,23 @@ def layout_all(pics, cfg):
                 p.auto_rot = 0
         n = compute_layout(auto, cfg)
     return n
+
+
+def layout_all(pics, cfg):
+    auto = [p for p in pics if not p.free]
+    for p in auto:
+        if not p.lock_rot:
+            p.auto_rot = 0
+    user_rows = cfg.rows
+    try:
+        if auto and cfg.auto_rows:
+            auto, cfg.rows = auto_fit(auto, cfg)
+        elif cfg.smart:
+            auto = smart_order(auto, cfg)
+        cfg.rows_used = cfg.rows
+        return _layout_inner(auto, cfg)
+    finally:
+        cfg.rows = user_rows
 
 
 # --------------------------------------------------------------------------
@@ -443,6 +573,20 @@ class ImageItem(W_.QGraphicsItem):
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(QRectF(0, 0, w, h))
+        if not sc.exporting and sc.cfg.guard:
+            fl = pic.flags(sc.cfg)
+            if fl:
+                txt = "! " + " / ".join(fl)
+                f = p.font()
+                f.setPointSizeF(3.0)
+                p.setFont(f)
+                tw = QtGui.QFontMetricsF(f).horizontalAdvance(txt) + 2.6
+                r = QRectF(0.8, 0.8, min(tw, max(4.0, w - 1.6)), 4.8)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(230, 110, 0, 235)))
+                p.drawRoundedRect(r, 0.8, 0.8)
+                p.setPen(QColor(255, 255, 255))
+                p.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
         if sc.exporting or not self.isSelected():
             return
         pen = QPen(ACCENT)
@@ -863,6 +1007,7 @@ class MainWindow(W_.QMainWindow):
         return a
 
     def _build_ui(self):
+        self._ctl, self._lab = {}, {}
         A = self.act
         a_open, a_save = A("Open...", "Ctrl+O", self.open_project), A("Save", "Ctrl+S", self.save_project)
         a_saveas = A("Save as...", "Ctrl+Shift+S", lambda: self.save_project(True))
@@ -914,11 +1059,36 @@ class MainWindow(W_.QMainWindow):
         dock.setFeatures(W_.QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         box = W_.QWidget()
         lay = W_.QVBoxLayout(box)
+        cba = W_.QCheckBox("Auto rows && columns (best fit)")
+        cba.setToolTip("Finds the number of rows per page for you; the number of pictures in\n"
+                       "each row (columns) follows automatically. Best used after adding all pictures.")
+        cba.setChecked(self.cfg.auto_rows)
+        cba.toggled.connect(lambda v: (self._cfg_set('auto_rows', v), self._enable_auto_ctls()))
+        self._ctl['auto_rows'] = cba
+        lay.addWidget(cba)
+        self._slider(lay, "Preferred picture size (mm)", 40, 140, int(self.cfg.ideal_side), float, "ideal_side", "{:.0f}",
+                     "Auto rows aims for pictures about this big (square-root of area)")
         self._slider(lay, "Rows per page", 20, 80, int(self.cfg.rows * 10), lambda v: v / 10.0, "rows", "{:.1f}",
-                     "Fewer rows = bigger pictures, more rows = smaller")
+                     "Manual mode: fewer rows = bigger pictures, more rows = smaller")
         self._slider(lay, "Gap (mm)", -60, 100, int(self.cfg.gap * 10), lambda v: v / 10.0, "gap", "{:.1f}",
                      "Negative values make neighbours overlap")
         self._slider(lay, "Page margin (mm)", 30, 250, int(self.cfg.margin * 10), lambda v: v / 10.0, "margin", "{:.1f}")
+        sp = W_.QSpinBox()
+        sp.setRange(1, 8)
+        sp.setValue(self.cfg.max_row)
+        sp.setPrefix("Max pictures per row: ")
+        sp.valueChanged.connect(lambda v: self._cfg_set('max_row', v))
+        self._ctl['max_row'] = sp
+        lay.addWidget(sp)
+        sp2 = W_.QSpinBox()
+        sp2.setRange(0, 30)
+        sp2.setSpecialValueText("Fit into pages: any")
+        sp2.setPrefix("Fit into pages: ")
+        sp2.setValue(self.cfg.pages)
+        sp2.setToolTip("Auto rows tries to use exactly this many pages")
+        sp2.valueChanged.connect(lambda v: self._cfg_set('pages', v))
+        self._ctl['pages'] = sp2
+        lay.addWidget(sp2)
         self.cb_smart = W_.QCheckBox("Smart order (ignore paste order)")
         self.cb_smart.setToolTip("Rearrange all images automatically for the best A4 fit:\n"
                                  "nothing too tiny, nothing too big. Dragging an image turns this off.")
@@ -935,6 +1105,43 @@ class MainWindow(W_.QMainWindow):
                        "Images you rotated yourself are left alone. Ctrl+Z undoes it.")
         btn.clicked.connect(self.auto_rotate_now)
         lay.addWidget(btn)
+        cbg = W_.QCheckBox("Warn: too small / low-res to print")
+        cbg.setToolTip("Orange badge on pictures that would print smaller than %d mm, below %d dpi,\n"
+                       "or with text under the minimum readable size.\n"
+                       "Badges are never printed or exported." % (self.cfg.min_side, self.cfg.min_dpi))
+        cbg.setChecked(self.cfg.guard)
+        cbg.toggled.connect(lambda v: (self._cfg_set('guard', v), self.scene.update()))
+        self._ctl['guard'] = cbg
+        lay.addWidget(cbg)
+        dt = W_.QDoubleSpinBox()
+        dt.setRange(0.0, 6.0)
+        dt.setSingleStep(0.1)
+        dt.setDecimals(1)
+        dt.setSuffix(" % of height")
+        dt.setPrefix("Smallest text: ")
+        dt.setValue(self.cfg.text_frac)
+        dt.setToolTip("Height of the lowercase letters (x-height) of the smallest body text in your\n"
+                      "pictures, as % of picture height. Typical infographic body text is about 1.2%.\n"
+                      "0 = don't check text size.")
+        dt.valueChanged.connect(lambda v: (self._cfg_set('text_frac', v), self.scene.update()))
+        self._ctl['text_frac'] = dt
+        lay.addWidget(dt)
+        dm = W_.QDoubleSpinBox()
+        dm.setRange(4.0, 14.0)
+        dm.setSingleStep(0.5)
+        dm.setDecimals(1)
+        dm.setPrefix("Min body text: ")
+        dm.setSuffix(" pt")
+        dm.setValue(self.cfg.min_text_pt)
+        dm.setToolTip("Legge & Bigelow (2011): reading speed is maximal only above the critical print size,\n"
+                      "x-height 1.4 mm (0.2 deg at 40 cm) = about 8 pt body text.\n"
+                      "Some readers need 4.5-5 pt x-height (about 9-10 pt body).")
+        dm.valueChanged.connect(lambda v: (self._cfg_set('min_text_pt', v), self.scene.update()))
+        self._ctl['min_text_pt'] = dm
+        lay.addWidget(dm)
+        bsel = W_.QPushButton("Select flagged pictures")
+        bsel.clicked.connect(self.select_flagged)
+        lay.addWidget(bsel)
         hint = W_.QLabel("<b>Drag</b>: reorder<br><b>Shift+drag</b>: float / overlap<br>"
                          "<b>Corner drag</b>: resize<br><b>Double-click</b>: crop<br>"
                          "<b>R</b> rotate \u00b7 <b>F</b> float \u00b7 <b>+/-</b> size<br>"
@@ -947,6 +1154,7 @@ class MainWindow(W_.QMainWindow):
         dock.setWidget(box)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.status = W_.QLabel()
+        self._enable_auto_ctls()
         self.statusBar().addPermanentWidget(self.status)
 
     def _slider(self, lay, title, lo, hi, val, conv, attr, fmt, tip=""):
@@ -964,6 +1172,38 @@ class MainWindow(W_.QMainWindow):
         upd(val)
         lay.addWidget(lab)
         lay.addWidget(s)
+        self._ctl[attr], self._lab[attr] = s, lab
+        return s
+
+    def _enable_auto_ctls(self):
+        auto = self.cfg.auto_rows
+        for k, on in (("ideal_side", auto), ("pages", auto), ("rows", not auto)):
+            self._ctl[k].setEnabled(on)
+            if k in self._lab:
+                self._lab[k].setEnabled(on)
+
+    def _sync_ui(self):
+        for attr, w in self._ctl.items():
+            v = getattr(self.cfg, attr)
+            if isinstance(w, W_.QSlider):
+                w.setValue(int(round(v * (10 if attr in ("rows", "gap", "margin") else 1))))
+            elif isinstance(w, W_.QSpinBox):
+                w.setValue(int(v))
+            elif isinstance(w, W_.QDoubleSpinBox):
+                w.setValue(float(v))
+            else:
+                w.setChecked(bool(v))
+        self._enable_auto_ctls()
+
+    def select_flagged(self):
+        self.scene.clearSelection()
+        n = 0
+        for pic, it in self.scene.items_by_pic.items():
+            if pic.flags(self.cfg):
+                it.setSelected(True)
+                n += 1
+        self.statusBar().showMessage("%d picture%s flagged (too small or low resolution)"
+                                     % (n, "" if n == 1 else "s"), 5000)
 
     def _cfg_set(self, attr, v):
         setattr(self.cfg, attr, v)
@@ -994,7 +1234,13 @@ class MainWindow(W_.QMainWindow):
             if p.free:
                 n = max(n, int(max(0, p.rect[1] + p.rect[3] / 2) // pitch) + 1)
         self.scene.sync(self.pics, n)
-        self.status.setText("%d images \u00b7 %d page%s" % (len(self.pics), n, "" if n == 1 else "s"))
+        txt = "%d images \u00b7 %d page%s" % (len(self.pics), n, "" if n == 1 else "s")
+        if self.cfg.auto_rows and self.pics:
+            txt += " \u00b7 auto %.1f rows" % getattr(self.cfg, "rows_used", self.cfg.rows)
+        bad = sum(1 for p in self.pics if p.flags(self.cfg)) if self.cfg.guard else 0
+        if bad:
+            txt += " \u00b7 \u26a0 %d too small/hard to read" % bad
+        self.status.setText(txt)
 
     def each_selected(self, fn):
         sel = self.selected_pics()
@@ -1263,7 +1509,11 @@ class MainWindow(W_.QMainWindow):
         if not path:
             return
         meta = dict(version=1, cfg=dict(rows=self.cfg.rows, gap=self.cfg.gap, margin=self.cfg.margin,
-                                        autorot=self.cfg.autorot, border=self.cfg.border), pics=[])
+                                        autorot=self.cfg.autorot, border=self.cfg.border,
+                                        smart=self.cfg.smart, auto_rows=self.cfg.auto_rows,
+                                        ideal_side=self.cfg.ideal_side, max_row=self.cfg.max_row,
+                                        pages=self.cfg.pages, guard=self.cfg.guard,
+                                        text_frac=self.cfg.text_frac, min_text_pt=self.cfg.min_text_pt), pics=[])
         with zipfile.ZipFile(path, 'w', zipfile.ZIP_STORED) as z:
             for i, p in enumerate(self.pics):
                 name = "img%03d.jpg" % i
@@ -1291,6 +1541,7 @@ class MainWindow(W_.QMainWindow):
         for k, v in meta.get('cfg', {}).items():
             setattr(self.cfg, k, v)
         self.pics, self.undo_stack, self.path = pics, [], path
+        self._sync_ui()
         self.relayout()
 
 
