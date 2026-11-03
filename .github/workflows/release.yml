@@ -39,8 +39,20 @@ jobs:
       - name: Build binary
         run: |
           pyinstaller --onefile --noconfirm --name collage-notes \
-            --collect-submodules PyQt6 \
             --exclude-module PySide6 \
+            --exclude-module PyQt6.QtMultimedia \
+            --exclude-module PyQt6.QtMultimediaWidgets \
+            --exclude-module PyQt6.QtTextToSpeech \
+            --exclude-module PyQt6.QtSpatialAudio \
+            --exclude-module PyQt6.QtNfc \
+            --exclude-module PyQt6.QtSql \
+            --exclude-module PyQt6.QtQml \
+            --exclude-module PyQt6.QtQuick \
+            --exclude-module PyQt6.QtWebSockets \
+            --exclude-module PyQt6.QtWebChannel \
+            --exclude-module PyQt6.QtBluetooth \
+            --exclude-module PyQt6.QtSensors \
+            --exclude-module PyQt6.QtSerialPort \
             collage-notes.py
           strip dist/collage-notes || true
           cd dist
