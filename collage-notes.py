@@ -31,6 +31,8 @@ PAGE_GAP = 14.0
 MAX_SIDE = 2600                    # cap pasted images (keeps RAM low)
 PREVIEW_SIDE = 1100                # screen-resolution copy
 MAX_ROW = 6                        # max images per row
+FIX_MAX_UP = 4.0                   # "fix low-res" never enlarges a picture more than this
+FIX_MAX_PIXELS = 24e6              # ... nor beyond this many pixels (keeps RAM low)
 ACCENT = QColor(30, 136, 229)
 
 
@@ -91,16 +93,34 @@ class Pic:
         xh_mm = cfg.text_frac / 100.0 * full_h * mm_per_px
         return xh_mm * 2.86 / 0.5
 
+    def dpi(self):
+        """Effective resolution (dpi) of the visible part at its current printed size."""
+        w = self.geom()[2]
+        c = self.crop
+        pw = (c[2] - c[0]) * self.img.width()
+        if self.total_rot() % 2:
+            pw = (c[3] - c[1]) * self.img.height()
+        return pw / max(1e-6, w / 25.4)
+
+    def fix_lowres(self, target_dpi):
+        """Enlarge + sharpen the pixels so the picture reaches target_dpi at its
+        current printed size.  Returns True if the image was changed."""
+        d = self.dpi()
+        if d >= target_dpi:
+            return False
+        iw, ih = self.img.width(), self.img.height()
+        f = min(target_dpi / d, FIX_MAX_UP, math.sqrt(FIX_MAX_PIXELS / max(1, iw * ih)))
+        if f < 1.1:
+            return False
+        self.img = enhance_lowres(self.img, f)
+        self._prev = None
+        return True
+
     def flags(self, cfg):
         """Print-size warnings: effective dpi and physical size on the A4 page."""
         x, y, w, h = self.geom()
-        c = self.crop
-        pw = (c[2] - c[0]) * self.img.width()
-        ph = (c[3] - c[1]) * self.img.height()
-        if self.total_rot() % 2:
-            pw, ph = ph, pw
         out = []
-        dpi = pw / max(1e-6, w / 25.4)
+        dpi = self.dpi()
         if dpi < cfg.min_dpi:
             out.append("%d dpi" % dpi)
         side = math.sqrt(max(0.0, w * h))
@@ -141,6 +161,7 @@ class Cfg:
     guard = True      # warn about pictures that print too small / low-res
     min_dpi = 110.0   # below this effective dpi a picture prints blurry
     min_side = 35.0   # mm: below this a picture is too small to read
+    fix_dpi = 150.0   # "Fix low-res" enlarges flagged pictures up to this effective dpi
     # Text legibility (Legge & Bigelow 2011, J. Vision 11(5):8): reading speed is
     # maximal only above the "critical print size", x-height ~0.2 deg = 1.4 mm
     # (= 4 pt x-height) at 40 cm, which is a body size of about 8 pt.
@@ -962,6 +983,45 @@ def image_sig(im):
     return (im.width(), im.height(), hashlib.md5(bytes(ba.data())).hexdigest())
 
 
+def _unsharp(im, radius, amount):
+    """Unsharp mask using only Qt blend modes (no numpy/PIL): blur, invert the
+    blur, mix it 50/50 with the picture to get a "high-pass" layer, then
+    hard-light that layer back over the picture."""
+    w, h = im.width(), im.height()
+    f = max(2, int(round(radius)))
+    sm = Qt.TransformationMode.SmoothTransformation
+    ig = Qt.AspectRatioMode.IgnoreAspectRatio
+    blur = im.scaled(max(1, w // f), max(1, h // f), ig, sm).scaled(w, h, ig, sm)
+    blur.invertPixels()
+    hp = im.copy()
+    q = QPainter(hp)
+    q.setOpacity(0.5)
+    q.drawImage(0, 0, blur)
+    q.end()
+    out = im.copy()
+    for _ in range(2):                  # two passes: one is too subtle on text
+        q = QPainter(out)
+        q.setCompositionMode(QPainter.CompositionMode.CompositionMode_HardLight)
+        q.setOpacity(amount)
+        q.drawImage(0, 0, hp)
+        q.end()
+    return out
+
+
+def enhance_lowres(im, factor, amount=1.0):
+    """Enlarge by `factor` (in smooth <=2x steps, which stays cleaner than one big
+    jump) and sharpen the edges so text on enlarged posters stays crisp in print.
+    This cannot invent detail that was never in the picture; it only stops the
+    printer from stretching and blurring the small bitmap."""
+    sm = Qt.TransformationMode.SmoothTransformation
+    ig = Qt.AspectRatioMode.IgnoreAspectRatio
+    tw, th = max(1, round(im.width() * factor)), max(1, round(im.height() * factor))
+    cur = im
+    while cur.width() < tw or cur.height() < th:
+        cur = cur.scaled(min(tw, cur.width() * 2), min(th, cur.height() * 2), ig, sm)
+    return _unsharp(cur, factor * 1.5, amount)
+
+
 def jpeg_bytes(im, q=95):
     ba = QtCore.QByteArray()
     buf = QtCore.QBuffer(ba)
@@ -1020,6 +1080,7 @@ class MainWindow(W_.QMainWindow):
         a_cw, a_ccw = A("Rotate right", "R", lambda: self.rotate(1)), A("Rotate left", "Shift+R", lambda: self.rotate(-1))
         a_autorot = A("Auto-rotate images to fit (once)", "Ctrl+Shift+R", self.auto_rotate_now)
         a_crop = A("Crop...", "C", self.crop_selected)
+        a_fix = A("Fix low-res pictures (enlarge + sharpen)", "Ctrl+Shift+F", self.fix_lowres)
         a_big, a_small = A("Bigger", "+|=", lambda: self.scale_sel(1.15)), A("Smaller", "-", lambda: self.scale_sel(1 / 1.15))
         a_float = A("Float / back to flow", "F", self.toggle_float)
         a_prev, a_next = A("Move earlier", "Ctrl+Left", lambda: self.move_order(-1)), A("Move later", "Ctrl+Right", lambda: self.move_order(1))
@@ -1039,7 +1100,7 @@ class MainWindow(W_.QMainWindow):
         for a in (a_paste, a_undo, a_del, a_all, None, a_unfloat):
             m.addAction(a) if a else m.addSeparator()
         m = mb.addMenu("&Image")
-        for a in (a_cw, a_ccw, a_autorot, a_crop, None, a_big, a_small, None, a_float, a_prev, a_next, None,
+        for a in (a_cw, a_ccw, a_autorot, a_crop, a_fix, None, a_big, a_small, None, a_float, a_prev, a_next, None,
                   a_front, a_back, a_tr, a_tl):
             m.addAction(a) if a else m.addSeparator()
         m = mb.addMenu("&View")
@@ -1047,7 +1108,7 @@ class MainWindow(W_.QMainWindow):
             m.addAction(a) if a else m.addSeparator()
 
         self.item_menu = W_.QMenu(self)
-        for a in (a_crop, a_cw, a_ccw, None, a_big, a_small, None, a_float, a_prev, a_next, a_front, a_back, None, a_del):
+        for a in (a_crop, a_fix, a_cw, a_ccw, None, a_big, a_small, None, a_float, a_prev, a_next, a_front, a_back, None, a_del):
             self.item_menu.addAction(a) if a else self.item_menu.addSeparator()
 
         tb = self.addToolBar("main")
@@ -1142,6 +1203,23 @@ class MainWindow(W_.QMainWindow):
         bsel = W_.QPushButton("Select flagged pictures")
         bsel.clicked.connect(self.select_flagged)
         lay.addWidget(bsel)
+        df = W_.QSpinBox()
+        df.setRange(100, 300)
+        df.setSingleStep(10)
+        df.setPrefix("Fix up to: ")
+        df.setSuffix(" dpi")
+        df.setValue(int(self.cfg.fix_dpi))
+        df.setToolTip("Target resolution for \"Fix low-res pictures\". 150 dpi is fine for text\n"
+                      "posters on a laser printer; higher means bigger project files.")
+        df.valueChanged.connect(lambda v: setattr(self.cfg, 'fix_dpi', float(v)))
+        self._ctl['fix_dpi'] = df
+        lay.addWidget(df)
+        bfix = W_.QPushButton("Fix low-res pictures")
+        bfix.setToolTip("Enlarges (smooth, in steps) and sharpens every picture flagged for low dpi\n"
+                        "(the ones with the orange dpi badge). Ctrl+Z undoes it.\n"
+                        "It improves how the print looks; it cannot add detail that is not there.")
+        bfix.clicked.connect(self.fix_lowres)
+        lay.addWidget(bfix)
         hint = W_.QLabel("<b>Drag</b>: reorder<br><b>Shift+drag</b>: float / overlap<br>"
                          "<b>Corner drag</b>: resize<br><b>Double-click</b>: crop<br>"
                          "<b>R</b> rotate \u00b7 <b>F</b> float \u00b7 <b>+/-</b> size<br>"
@@ -1205,6 +1283,26 @@ class MainWindow(W_.QMainWindow):
         self.statusBar().showMessage("%d picture%s flagged (too small or low resolution)"
                                      % (n, "" if n == 1 else "s"), 5000)
 
+    def fix_lowres(self):
+        todo = [p for p in self.pics if p.dpi() < self.cfg.min_dpi]
+        if not todo:
+            self.statusBar().showMessage("No low-resolution pictures to fix", 4000)
+            return
+        self.push_undo()
+        target = max(self.cfg.fix_dpi, self.cfg.min_dpi * 1.05)
+        W_.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            n = sum(1 for p in todo if p.fix_lowres(target))
+        finally:
+            W_.QApplication.restoreOverrideCursor()
+        self.relayout()
+        left = sum(1 for p in todo if p.dpi() < self.cfg.min_dpi)
+        msg = "Enlarged + sharpened %d picture%s" % (n, "" if n == 1 else "s")
+        if left:
+            msg += " \u00b7 %d still below %d dpi: print them smaller or use a bigger source" % (
+                left, self.cfg.min_dpi)
+        self.statusBar().showMessage(msg, 8000)
+
     def _cfg_set(self, attr, v):
         setattr(self.cfg, attr, v)
         self._timer.start(10)
@@ -1215,16 +1313,18 @@ class MainWindow(W_.QMainWindow):
         return [p for p in self.pics if p in sel]
 
     def push_undo(self):
-        self.undo_stack.append([(p, p.state()) for p in self.pics])
+        self.undo_stack.append([(p, p.state(), p.img) for p in self.pics])
         del self.undo_stack[:-60]
 
     def do_undo(self):
         if not self.undo_stack:
             return
         snap = self.undo_stack.pop()
-        self.pics = [p for p, _ in snap]
-        for p, s in snap:
+        self.pics = [p for p, _, _ in snap]
+        for p, s, im in snap:
             p.set_state(s)
+            if p.img is not im:             # undo of "fix low-res"
+                p.img, p._prev = im, None
         self.relayout()
 
     def relayout(self):
@@ -1513,7 +1613,8 @@ class MainWindow(W_.QMainWindow):
                                         smart=self.cfg.smart, auto_rows=self.cfg.auto_rows,
                                         ideal_side=self.cfg.ideal_side, max_row=self.cfg.max_row,
                                         pages=self.cfg.pages, guard=self.cfg.guard,
-                                        text_frac=self.cfg.text_frac, min_text_pt=self.cfg.min_text_pt), pics=[])
+                                        text_frac=self.cfg.text_frac, min_text_pt=self.cfg.min_text_pt,
+                                        fix_dpi=self.cfg.fix_dpi), pics=[])
         with zipfile.ZipFile(path, 'w', zipfile.ZIP_STORED) as z:
             for i, p in enumerate(self.pics):
                 name = "img%03d.jpg" % i
